@@ -89,7 +89,9 @@ case "${1:-}" in
       # from stdin, so a pipe here would silently feed it as the script.)
       while IFS= read -r p; do
         python3 - "$CONFIG" "$p" <<'PY'
-import sys, yaml
+import sys, yaml, signal
+# die quietly like a normal unix tool when piped into head/less
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 cfg, loaded = sys.argv[1], sys.argv[2]
 d = yaml.safe_load(open(cfg))
 mid = next((k for k, m in d.get("models", {}).items() if loaded in (m.get("cmd") or "")), None)
