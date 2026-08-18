@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Resolve a model id or alias to its llama.cpp web UI URL.
+
+Model ids contain '/' and ':' (e.g. ggml-org/Qwen3.8-27B-GGUF:Q4_K_M). Those
+are fine in the /upstream/ path - verified HTTP 200 - but they cannot be
+matched with a naive grep of the YAML, which is why this uses a real parser.
+"""
+import json, os, re, socket, subprocess, sys, urllib.request
+
+CONFIG = "/etc/llama-swap/config.yaml"
+PORT = 8080
+
+def load_models():
+    import yaml
+    d = yaml.safe_load(open(CONFIG))
+    return d.get("models", {})
+
+def served_ids():
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/models", timeout=5) as r:
+            return [m["id"] for m in json.load(r)["data"]]
+    except Exception:
+        return []
+
+def loaded_model_path():
+    try:
+        out = subprocess.run(["pgrep", "-af", "llama-server"], capture_output=True, text=True).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        m = re.search(r"-m\s+(\S+\.gguf)", line)
+        if m:
+            return m.group(1)
+    return None
+
+def resolve(models, want):
+    """Accept a canonical id or any alias, case-insensitively."""
+    if want in models:
+        return want
+    lower = {k.lower(): k for k in models}
+    if want.lower() in lower:
+        return lower[want.lower()]
+    for mid, cfg in models.items():
+        for a in (cfg.get("aliases") or []):
+            if a.lower() == want.lower():
+                return mid
+    return None
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    models = load_models()
+    host = socket.gethostname()
+    base = f"http://{host}.local:{PORT}"
+
+    if args and args[0] in ("-a", "--all"):
+        print("llama.cpp web UI URLs (each shows tokens/sec per message):\n")
+        for mid, cfg in models.items():
+            al = ", ".join(cfg.get("aliases") or []) or "-"
+            print(f"  {mid}")
+            print(f"      aliases: {al}")
+            print(f"      {base}/upstream/{mid}/\n")
+        print(f"llama-swap dashboard: {base}/ui/")
+        return
+
+    if args:
+        want = args[0]
+        mid = resolve(models, want)
+        if not mid:
+            print(f"unknown model or alias: {want}\n")
+            print("Known models:")
+            for m in models:
+                al = ", ".join(models[m].get("aliases") or [])
+                print(f"  {m}" + (f"   (aliases: {al})" if al else ""))
+            sys.exit(1)
+        note = "" if mid == want else f"  (resolved from alias '{want}')"
+        loaded = loaded_model_path()
+        cmd = models[mid].get("cmd", "")
+        warn = ""
+        if loaded and loaded not in cmd:
+            warn = ("\n  NOTE: a different model is loaded right now. Opening this URL\n"
+                    "        will trigger a swap and reload tens of GiB.")
+        print(f"{mid}{note}")
+        print(f"  {base}/upstream/{mid}/{warn}")
+        return
+
+    # No argument: use whatever is loaded, so the URL never triggers a swap.
+    loaded = loaded_model_path()
+    mid = None
+    if loaded:
+        for k, cfg in models.items():
+            if loaded in cfg.get("cmd", ""):
+                mid = k
+                break
+    if mid:
+        print(f"currently loaded: {mid}")
+    else:
+        ids = served_ids() or list(models)
+        if not ids:
+            sys.exit("no models configured")
+        mid = ids[0]
+        print(f"nothing loaded; defaulting to {mid} (opening this will load it)")
+    print(f"  {base}/upstream/{mid}/")
+    print(f"\nllama-swap dashboard: {base}/ui/")
+    print("Tip: 'llm ui --all' lists every model's URL.")
+
+if __name__ == "__main__":
+    main()

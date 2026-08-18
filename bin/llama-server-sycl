@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# llama-server on the SYCL backend. Fastest for dense models on Battlemage.
+# setvars.sh is not -u safe, so guard it.
+set +u
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+set -u
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+exec /home/mojs/llama.cpp/build-sycl/bin/llama-server "$@"

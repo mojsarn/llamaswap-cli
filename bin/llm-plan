@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Work out how to split a GGUF across GPU and CPU.
+
+Reads per-tensor sizes rather than dividing the file size by layer count, so
+the numbers reflect what actually has to be allocated. Handles three cases:
+
+  fits           - everything on the GPU
+  MoE, too big   - park expert weights of the first N layers in RAM (-ncmoe N)
+  dense, too big - keep the first N layers on the GPU (-ngl N)
+
+Measured on this box, 2026-08-17:
+  * Moving even ONE layer to CPU cost 21% of generation speed, and 16 layers
+    cost 70%. So for dense models we trade context away first and only split
+    layers as a last resort.
+  * MoE is the opposite: experts are sparsely activated, so parking them in
+    RAM is cheap (Qwen3.6-35B-A3B held 29 tok/s with -ncmoe 4).
+  * Quantizing the KV cache to q4_0 doubled usable context at no measurable
+    speed cost, which is always cheaper than moving layers.
+"""
+import argparse, json, os, re, sys
+
+sys.path.insert(0, "/home/mojs/llama.cpp/gguf-py")
+
+VRAM_GIB = 31.89
+
+# 2026-08-17, measured rather than guessed. Qwen3.8-27B-Q8_0 ran stably at
+# 31.68 GiB (q8_0 KV, 122880 ctx) and 31.67 GiB (q4_0 KV, 229376 ctx) = 99.3%
+# of 31.89 GiB. The next step up failed in each case, so ~99.3% is the hard
+# wall and 0.99 sits just inside it.
+# CAVEAT: those runs used short prompts. A long prompt or an image needs more
+# compute buffer; if a model this predicts will fit throws DEVICE_LOST or
+# OUT_OF_DEVICE_MEMORY, drop this back to 0.95.
+USABLE_FRACTION = 0.99
+
+MIN_CTX = 4096          # floor when trading context away to stay resident
+GIB = 1024 ** 3
+
+
+def meta(path):
+    from gguf import GGUFReader, GGUFValueType
+    r = GGUFReader(path)
+    out = {}
+    for k, f in r.fields.items():
+        try:
+            # Prefer the library's own accessor when present.
+            if hasattr(f, "contents"):
+                v = f.contents()
+                if v is not None:
+                    out[k] = v
+                    continue
+            # Compare enum members directly: str() on an IntEnum returns the
+            # NUMBER on Python 3.11+, so name-matching silently fails and you
+            # end up decoding the first byte of a string as an integer.
+            if f.types and f.types[0] == GGUFValueType.STRING:
+                out[k] = bytes(f.parts[f.data[0]]).decode("utf-8", "replace")
+            else:
+                out[k] = f.parts[f.data[0]].tolist()[0]
+        except Exception:
+            pass
+    return out
+
+
+def analyse(path):
+    from gguf import GGUFReader
+    r = GGUFReader(path)
+    kv = meta(path)
+
+    arch = kv.get("general.architecture") or ""
+    g = lambda k, d=0: int(kv.get(f"{arch}.{k}") or d)
+
+    info = {
+        "arch": arch,
+        "blocks": g("block_count", 0),
+        "ctx_native": kv.get(f"{arch}.context_length"),
+        "kv_heads": g("attention.head_count_kv", g("attention.head_count", 8)),
+        "klen": g("attention.key_length", 128),
+        "vlen": g("attention.value_length", 128),
+        "experts": g("expert_count", 0),
+        "experts_used": g("expert_used_count", 0),
+    }
+
+    per_layer, expert_per_layer, non_layer = {}, {}, 0
+    for t in r.tensors:
+        nbytes = int(t.n_bytes)
+        m = re.match(r"blk\.(\d+)\.", t.name)
+        if m:
+            i = int(m.group(1))
+            per_layer[i] = per_layer.get(i, 0) + nbytes
+            if "_exps" in t.name:          # MoE expert tensors
+                expert_per_layer[i] = expert_per_layer.get(i, 0) + nbytes
+        else:
+            non_layer += nbytes
+
+    info["total_bytes"] = sum(per_layer.values()) + non_layer
+    info["non_layer_bytes"] = non_layer
+    info["layer_bytes"] = (sum(per_layer.values()) / len(per_layer)) if per_layer else 0
+    info["expert_bytes"] = (sum(expert_per_layer.values()) / len(expert_per_layer)) if expert_per_layer else 0
+    info["is_moe"] = info["experts"] > 0 and info["expert_bytes"] > 0
+    return info
+
+
+def kv_bytes_per_token(info, cache="q8_0"):
+    # NOTE: this OVERESTIMATES for architectures using sliding-window attention
+    # (measured ~3x high on qwen35). Treat it as an upper bound.
+    per_elem = {"q8_0": 1.06, "q4_0": 0.56, "f16": 2.0}[cache]
+    return info["blocks"] * info["kv_heads"] * (info["klen"] + info["vlen"]) * per_elem
+
+
+def plan(path, ctx=None, mmproj=None, cache="q8_0"):
+    i = analyse(path)
+    if not i["arch"] or i["ctx_native"] is None:
+        raise SystemExit(
+            f"could not read architecture/context_length from {os.path.basename(path)} "
+            f"(arch={i['arch']!r}). Refusing to guess - add it with 'llm edit'.")
+
+    native = int(i["ctx_native"])
+    budget = VRAM_GIB * USABLE_FRACTION * GIB
+    mm = os.path.getsize(mmproj) if mmproj and os.path.exists(mmproj) else 0
+    ctx = ctx or native
+    requested = ctx
+    kvb = kv_bytes_per_token(i, cache)
+
+    # Dense: staying fully GPU-resident beats a big context by a wide margin
+    # (measured 10.8 -> 8.5 tok/s for ONE layer moved). Trade context first.
+    # MoE: moving experts is cheap, so keep the context instead.
+    if not i["is_moe"]:
+        while ctx > MIN_CTX and (i["total_bytes"] + mm + ctx * kvb) > budget:
+            ctx //= 2
+    else:
+        while ctx > MIN_CTX and ctx * kvb > budget * 0.35:
+            ctx //= 2
+
+    need = i["total_bytes"] + mm + ctx * kvb
+    out = {
+        "arch": i["arch"], "blocks": i["blocks"], "is_moe": i["is_moe"],
+        "experts": i["experts"], "ctx": ctx, "cache": cache,
+        "model_gib": i["total_bytes"] / GIB, "mmproj_gib": mm / GIB,
+        "kv_gib": ctx * kvb / GIB, "need_gib": need / GIB,
+        "budget_gib": budget / GIB,
+    }
+
+    if need <= budget:
+        note = "fits entirely in VRAM"
+        if ctx < requested:
+            note += (f" at {ctx} ctx (reduced from {requested}). Try --cache q4_0 "
+                     "first - it roughly doubles context at no measured speed cost")
+        out.update(strategy="fits", ngl=99, ncmoe=0, note=note)
+        return out
+
+    over = need - budget
+
+    if i["is_moe"]:
+        n = min(i["blocks"], int(over // i["expert_bytes"]) + 1)
+        out.update(strategy="moe-cpu-experts", ngl=99, ncmoe=n,
+                   note=f"{over/GIB:.1f}GiB over; move experts of first {n} layers "
+                        f"to RAM ({i['expert_bytes']/GIB:.2f}GiB each). Only "
+                        f"{i['experts_used']}/{i['experts']} experts fire per token, "
+                        "so this is cheap.")
+        return out
+
+    avail = budget - mm - ctx * kvb - i["non_layer_bytes"]
+    n = max(0, min(int(avail // i["layer_bytes"]), i["blocks"]))
+    out.update(strategy="dense-partial", ngl=n, ncmoe=0,
+               note=f"{over/GIB:.1f}GiB over even at {MIN_CTX} ctx; {n} of "
+                    f"{i['blocks']} layers on GPU. WARNING: measured cost of moving "
+                    "layers is ~21% for the first and ~70% for 16. Prefer a smaller "
+                    "quant, q4_0 KV, or dropping --mmproj.")
+    return out
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model")
+    ap.add_argument("--ctx", type=int, default=None)
+    ap.add_argument("--mmproj", default=None)
+    ap.add_argument("--cache", default="q8_0", choices=["q8_0", "q4_0", "f16"])
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    p = plan(a.model, a.ctx, a.mmproj, a.cache)
+    if a.json:
+        print(json.dumps(p, indent=2)); sys.exit(0)
+
+    kind = f"MoE, {p['experts']} experts" if p["is_moe"] else "dense"
+    print(f"  model      : {os.path.basename(a.model)}")
+    print(f"  arch       : {p['arch']}  ({kind}, {p['blocks']} layers)")
+    print(f"  sizes      : {p['model_gib']:.1f}GiB weights"
+          + (f" + {p['mmproj_gib']:.1f}GiB mmproj" if p['mmproj_gib'] else "")
+          + f" + {p['kv_gib']:.1f}GiB KV @ {p['ctx']} ctx ({p['cache']}) = {p['need_gib']:.1f}GiB")
+    print(f"  budget     : {p['budget_gib']:.1f}GiB usable of {VRAM_GIB}GiB")
+    print(f"  strategy   : {p['strategy']}")
+    print(f"  flags      : -ngl {p['ngl']}" + (f" -ncmoe {p['ncmoe']}" if p['ncmoe'] else "")
+          + f" -c {p['ctx']} --cache-type-k/v {p['cache']}")
+    print(f"  note       : {p['note']}")

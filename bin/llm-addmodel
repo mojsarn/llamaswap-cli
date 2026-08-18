@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Add a downloaded GGUF to the llama-swap config, sized by llm-plan."""
+import argparse, json, os, re, subprocess, sys
+
+CONFIG = "/etc/llama-swap/config.yaml"
+MODELS = "/opt/models/gguf"
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--quant", required=True)
+    ap.add_argument("--mmproj", default="")
+    ap.add_argument("--id", default="")
+    a = ap.parse_args()
+
+    path = os.path.join(MODELS, a.repo, a.file)
+    if not os.path.exists(path):
+        sys.exit(f"not found: {path}")
+    mmproj = os.path.join(MODELS, a.repo, a.mmproj) if a.mmproj else ""
+
+    cmd = ["/usr/local/bin/llm-plan", path, "--json"]
+    if mmproj:
+        cmd += ["--mmproj", mmproj]
+    try:
+        p = json.loads(subprocess.check_output(cmd, text=True))
+    except Exception as e:
+        sys.exit(f"could not plan this model ({e}); add it with 'llm edit'")
+
+    model_id = a.id or f"{a.repo}:{a.quant}"
+    cfg = open(CONFIG).read()
+    if f'"{model_id}"' in cfg:
+        sys.exit(f"already configured: {model_id}\nEdit it with: llm edit")
+
+    alias = re.sub(r"[^a-zA-Z0-9]+", "-",
+                   f"{a.repo.split('/')[-1].replace('-GGUF','')}-{a.quant}").lower().strip("-")
+
+    lines = [
+        f'\n  "{model_id}":',
+        f"    name: {a.file}",
+        f"    description: {p['arch']}, {p['model_gib']:.1f}GiB, {p['strategy']}, {p['ctx']} ctx",
+        f"    # {p['note']}",
+        "    cmd: |",
+        "      /usr/local/bin/llama-server-sycl",
+        "      --host 127.0.0.1 --port ${PORT}",
+        f"      -m {path}",
+    ]
+    if mmproj:
+        lines.append(f"      --mmproj {mmproj}")
+    lines.append(f"      -ngl {p['ngl']}")
+    if p.get("ncmoe"):
+        lines.append(f"      -ncmoe {p['ncmoe']}")
+    lines += [
+        f"      -c {p['ctx']}",
+        "      -fa on",
+        "      --cache-type-k q8_0",
+        "      --cache-type-v q8_0",
+        "      --jinja",
+        "    aliases:",
+        f"      - {alias}",
+        "    ttl: 1800",
+        "",
+    ]
+
+    open(CONFIG, "a").write("\n".join(lines))
+    try:
+        import yaml
+        d = yaml.safe_load(open(CONFIG))
+        assert model_id in d["models"]
+    except Exception as e:
+        open(CONFIG, "w").write(cfg)
+        sys.exit(f"config would be invalid ({e}); rolled back")
+
+    print(f"added:    {model_id}")
+    print(f"alias:    {alias}")
+    print(f"strategy: {p['strategy']}")
+    print(f"flags:    -ngl {p['ngl']}" + (f" -ncmoe {p['ncmoe']}" if p.get('ncmoe') else "") + f" -c {p['ctx']}")
+    print(f"vram:     {p['need_gib']:.1f} GiB of {p['budget_gib']:.1f} GiB usable")
+    print(f"note:     {p['note']}")
+
+if __name__ == "__main__":
+    main()

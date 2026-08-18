@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# llama-server on the Vulkan backend. Fallback for architectures SYCL mishandles.
+exec /home/mojs/llama.cpp/build-vulkan/bin/llama-server "$@"

@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# Model management for the llama-swap server.
+# Models live at $MODELS/<org>/<repo>/<file>.gguf so the path is the provenance.
+set -uo pipefail
+
+MODELS=/opt/models/gguf
+CONFIG=/etc/llama-swap/config.yaml
+API=http://127.0.0.1:8080
+DUMP="/home/mojs/llama.cpp/gguf-py/gguf/scripts/gguf_dump.py"
+
+usage() {
+  cat <<USAGE
+llm - manage models on this inference server
+
+  llm list                     models served, and which is loaded
+  llm files                    GGUFs on disk, grouped by source repo
+  llm info <file.gguf>         architecture, params, quant, context, GQA layout
+  llm plan <file.gguf>         how to split it across GPU/CPU and why
+  llm search <query>           search HuggingFace for GGUF repos
+  llm quants <repo>            list a repo's GGUF files with sizes
+  llm get <repo>:<QUANT>       download AND configure, e.g. bartowski/Foo-GGUF:Q5_K_M
+                               (fetches the vision projector, sizes the context
+                                to fit VRAM, adds the block, reloads)
+  llm get --no-add <repo>:<Q>  download only, leave the config alone
+  llm get <repo> <file.gguf>   download an exact filename
+  llm rm <file.gguf>           delete a model (refuses if still in the config)
+  llm path <file.gguf>         print the full path (for pasting into the config)
+  llm edit                     edit the llama-swap config
+  llm reload                   restart llama-swap to apply config changes
+  llm log                      follow the llama-swap log
+  llm vram                     VRAM used by the loaded model
+  llm bench [model] [ntok] [par]
+                               measure speed sequential (1x) then parallel (par concurrent
+                               requests, per-request + aggregate tok/s).
+                               Defaults: 200 tok, par=4. Note 'par' only sets how many
+                               requests are sent - the server's slot count is --parallel
+                               in the model's cmd: block in the llama-swap config.
+  llm ui [model|alias]         web UI URL; no arg = whatever is loaded
+  llm ui --all                 every model's URL
+  llm gpu [seconds]            GPU utilisation, power, clocks, VRAM (default 2s)
+
+Files land in $MODELS/<org>/<repo>/, so the directory tells you exactly which
+publisher a model came from. Filenames alone are ambiguous between publishers.
+USAGE
+}
+
+find_model() {  # $1=basename-or-path -> full path
+  if [ -f "$1" ]; then echo "$1"; return 0; fi
+  find "$MODELS" -name "$(basename "$1")" -type f 2>/dev/null | head -1
+}
+
+hf_files() {
+  # A missing repo returns a JSON error object, not a model, so guard the
+  # iteration - otherwise jq prints "Cannot iterate over null" to stderr
+  # before our own message.
+  curl -s "https://huggingface.co/api/models/$1?blobs=true" \
+    | jq -r 'if type == "object" and has("siblings") then
+               .siblings[] | select(.rfilename|test("gguf$"))
+               | "\((.size // 0)/1073741824*10|floor/10)\t\(.rfilename)"
+             else empty end' 2>/dev/null
+}
+
+download_one() {  # $1=repo $2=path-in-repo
+  local repo="$1" f="$2" out dest
+  out=$(basename "$f")
+  dest="$MODELS/$repo"
+  mkdir -p "$dest"
+  echo "--> $repo/$out"
+  local PB; [ -t 1 ] && PB=--progress-bar || PB=--silent
+  curl -fL -C - --retry 5 --retry-delay 5 $PB \
+    -o "$dest/$out" "https://huggingface.co/$repo/resolve/main/$f" \
+    || { echo "FAILED: $out"; return 1; }
+}
+
+case "${1:-}" in
+  list)
+    echo "=== configured ==="
+    curl -s --max-time 10 $API/v1/models | jq -r '.data[].id' 2>/dev/null || echo "(llama-swap not responding)"
+    echo
+    echo "=== currently loaded ==="
+    # Match on field 2 (the exe path) ending in /llama-server - pgrep -af
+    # otherwise self-matches whatever wrapper process's argv happens to
+    # contain this same command text (e.g. a shell -c wrapper).
+    LOADED=$(pgrep -af 'llama-server .*-m ' | awk '$2 ~ /\/llama-server$/' | sed 's|.*-m \([^ ]*\).*|\1|')
+    if [ -n "$LOADED" ]; then
+      # Resolve each loaded -m path back to its config id, so this matches
+      # the "configured" list above instead of printing a raw filesystem path.
+      # (path passed as argv, not piped - `python3 -` reads its own program
+      # from stdin, so a pipe here would silently feed it as the script.)
+      while IFS= read -r p; do
+        python3 - "$CONFIG" "$p" <<'PY'
+import sys, yaml
+cfg, loaded = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(cfg))
+mid = next((k for k, m in d.get("models", {}).items() if loaded in (m.get("cmd") or "")), None)
+print(mid or loaded)
+PY
+      done <<< "$LOADED"
+    else
+      echo "(none)"
+    fi
+    echo
+    echo "=== service: $(systemctl is-active llama-swap) ==="
+    ;;
+
+  files)
+    if ! find "$MODELS" -name '*.gguf' -type f | grep -q .; then echo "(no models)"; exit 0; fi
+    CUR=""
+    while IFS= read -r f; do
+      rel="${f#$MODELS/}"
+      repo="$(dirname "$rel")"
+      if [ "$repo" != "$CUR" ]; then
+        [ -n "$CUR" ] && echo
+        echo "=== $repo ==="
+        CUR="$repo"
+      fi
+      printf '  %-8s %s\n' "$(du -h "$f" | cut -f1)" "$(basename "$f")"
+    done < <(find "$MODELS" -name '*.gguf' -type f | sort)
+    echo
+    df -h "$MODELS" | tail -1
+    ;;
+
+  path)
+    [ -z "${2:-}" ] && { echo "usage: llm path <file.gguf>"; exit 1; }
+    F=$(find_model "$2")
+    [ -n "$F" ] && echo "$F" || { echo "not found: $2"; exit 1; }
+    ;;
+
+  info)
+    [ -z "${2:-}" ] && { echo "usage: llm info <file.gguf>"; exit 1; }
+    F=$(find_model "$2")
+    [ -n "$F" ] || { echo "not found: $2"; exit 1; }
+    echo "=== ${F#$MODELS/} ($(du -h "$F" | cut -f1)) ==="
+    echo "source repo: $(dirname "${F#$MODELS/}")"
+    echo
+    PYTHONPATH=/home/mojs/llama.cpp/gguf-py python3 "$DUMP" --no-tensors "$F" 2>/dev/null \
+      | grep -viE 'tokenizer\.ggml\.(tokens|scores|token_type|merges)' | head -40
+    ;;
+
+  search)
+    [ -z "${2:-}" ] && { echo "usage: llm search <query>"; exit 1; }
+    curl -s "https://huggingface.co/api/models?search=$2%20GGUF&sort=downloads&direction=-1&limit=20" \
+      | jq -r '.[] | select(.id|test("GGUF";"i")) | .id'
+    ;;
+
+  quants)
+    [ -z "${2:-}" ] && { echo "usage: llm quants <repo>"; exit 1; }
+    hf_files "$2" | awk -F'\t' '{printf "%-9s %s\n", $1" GiB", $2}' | sort -k2
+    ;;
+
+  get)
+    NOADD=0
+    if [ "${2:-}" = "--no-add" ]; then NOADD=1; shift; fi
+    [ -z "${2:-}" ] && { echo "usage: llm get [--no-add] <repo>:<QUANT> | llm get <repo> <file>"; exit 1; }
+    if [ -n "${3:-}" ]; then
+      REPO="$2"; FILE="$3"
+      # A colon here means the two forms got mixed; it would create a
+      # directory literally named "Repo-GGUF:Q8_0".
+      if [[ "$REPO" == *:* ]]; then
+        echo "repo contains ':' - do not mix the two forms."
+        echo "  use either:  llm get ${REPO%%:*}:${REPO##*:}"
+        echo "  or:          llm get ${REPO%%:*} $FILE"
+        exit 1
+      fi
+    elif [[ "$2" == *:* ]]; then
+      REPO="${2%%:*}"; QUANT="${2##*:}"
+      echo "resolving $QUANT in $REPO ..."
+      ALL=$(hf_files "$REPO" | cut -f2)
+      [ -z "$ALL" ] && { echo "no GGUF files in $REPO (does it exist?)"; exit 1; }
+      MATCH=$(echo "$ALL" | grep -iE "[-.]${QUANT}([-.]|$|-[0-9]{5}-of-)" || true)
+      [ -z "$MATCH" ] && MATCH=$(echo "$ALL" | grep -i -- "$QUANT" || true)
+      if [ -z "$MATCH" ]; then
+        echo "no file matching '$QUANT'. Available:"; echo "$ALL" | sed 's/^/  /'; exit 1
+      fi
+      BASES=$(echo "$MATCH" | sed -E 's/-[0-9]{5}-of-[0-9]{5}\.gguf$/.gguf/' | sort -u)
+      if [ "$(echo "$BASES" | grep -c .)" -gt 1 ]; then
+        echo "ambiguous - '$QUANT' matches several models:"
+        echo "$MATCH" | sed 's/^/  /'
+        echo "Re-run with an exact filename: llm get $REPO <file.gguf>"; exit 1
+      fi
+      FILE="$MATCH"
+    else
+      echo "usage: llm get <repo>:<QUANT> | llm get <repo> <file>"; exit 1
+    fi
+
+    # Check the repo resolves and the files exist BEFORE creating any
+    # directory - a typo used to leave an empty tree behind.
+    echo "verifying $REPO ..."
+    AVAIL=$(hf_files "$REPO" | cut -f2)
+    if [ -z "$AVAIL" ]; then
+      echo "repo not found, or it contains no GGUF files: $REPO"
+      echo "Check the spelling, or list candidates with: llm search <name>"
+      exit 1
+    fi
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      if ! printf '%s\n' "$AVAIL" | grep -qxF "$f"; then
+        echo "not in $REPO: $f"
+        echo "Available GGUF files:"
+        printf '%s\n' "$AVAIL" | sed 's/^/  /' | head -20
+        exit 1
+      fi
+    done <<< "$FILE"
+
+    RC=0
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      download_one "$REPO" "$f" || RC=1
+    done <<< "$FILE"
+
+    echo
+    if [ $RC -ne 0 ]; then exit $RC; fi
+    echo "stored under: $MODELS/$REPO/"
+
+    if [ "${NOADD:-0}" = "1" ]; then
+      echo "(--no-add given; not touching the config)"
+      exit 0
+    fi
+    # Multi-part sets cannot be pointed at with a single -m; leave those manual.
+    if [ "$(echo "$FILE" | grep -c .)" -gt 1 ]; then
+      echo "multi-part model: add it manually with 'llm edit'"
+      exit 0
+    fi
+
+    MAIN=$(basename "$FILE")
+    # mmproj files are vision projectors, not standalone models.
+    case "$MAIN" in
+      mmproj-*|mtp-*|dflash-*)
+        echo "$MAIN is a companion file (vision/draft), not a standalone model."
+        echo "It will be picked up automatically when you add the model it belongs to."
+        exit 0 ;;
+    esac
+
+    # Fetch the matching vision projector from the same repo if one exists.
+    MMPROJ=""
+    CAND=$(hf_files "$REPO" | cut -f2 | grep -i '^mmproj' | grep -iE 'q8_0|f16|bf16' | head -1)
+    if [ -n "$CAND" ]; then
+      if [ ! -f "$MODELS/$REPO/$(basename "$CAND")" ]; then
+        echo
+        echo "vision projector found in repo; fetching $CAND"
+        download_one "$REPO" "$CAND" || true
+      fi
+      [ -f "$MODELS/$REPO/$(basename "$CAND")" ] && MMPROJ=$(basename "$CAND")
+    fi
+
+    echo
+    echo "=== configuring ==="
+    # With the two-arg form QUANT is never set, so recover it from the
+    # filename: take the last quant-looking token (Q4_K_M, IQ2_XXS, BF16...).
+    if [ -z "${QUANT:-}" ]; then
+      QUANT=$(echo "$MAIN" \
+        | grep -oiE '(I?Q[0-9]+(_[A-Z0-9]+)*|BF16|F16|F32)' \
+        | tail -1 | tr '[:lower:]' '[:upper:]')
+    fi
+    if [ -z "${QUANT:-}" ]; then
+      echo "could not determine the quant from '$MAIN'."
+      echo "Add it manually with 'llm edit', or re-run as <repo>:<QUANT>."
+      exit 1
+    fi
+    echo "quant: $QUANT"
+    if sudo /usr/local/bin/llm-addmodel --repo "$REPO" --file "$MAIN" \
+         --quant "$QUANT" --mmproj "$MMPROJ"; then
+      echo
+      echo "reloading llama-swap ..."
+      sudo systemctl restart llama-swap
+      for i in $(seq 1 30); do
+        curl -s --max-time 3 $API/v1/models >/dev/null 2>&1 && break
+        sleep 1
+      done
+      echo "models now served:"
+      curl -s $API/v1/models | jq -r '.data[].id' | sed 's/^/  /'
+    else
+      echo "config step failed; the file is downloaded, add it with 'llm edit'"
+    fi
+    exit 0
+    ;;
+
+  rm)
+    [ -z "${2:-}" ] && { echo "usage: llm rm <file.gguf>"; exit 1; }
+    F=$(find_model "$2")
+    [ -n "$F" ] || { echo "not found: $2"; exit 1; }
+    if grep -qF "$(basename "$F")" "$CONFIG"; then
+      echo "REFUSING: $(basename "$F") is still referenced in $CONFIG"
+      echo "Remove its block with 'llm edit' first."; exit 1
+    fi
+    echo "deleting ${F#$MODELS/} ($(du -h "$F" | cut -f1))"
+    rm -i "$F"
+    # Clean up the repo directory if it is now empty.
+    rmdir -p --ignore-fail-on-non-empty "$(dirname "$F")" 2>/dev/null
+    ;;
+
+  edit)   sudo "${EDITOR:-nano}" "$CONFIG" ;;
+
+  reload)
+    sudo systemctl restart llama-swap; sleep 3
+    systemctl is-active llama-swap
+    curl -s --max-time 10 $API/v1/models | jq -r '.data[].id'
+    ;;
+
+  log)    sudo journalctl -u llama-swap -f ;;
+
+  vram)
+    # See the comment in `list)` - filter on the exe path to avoid pgrep
+    # self-matching a wrapper process's argv.
+    LOADED_LINE=$(pgrep -af 'llama-server .*-m ' | awk '$2 ~ /\/llama-server$/' | head -1)
+    PID=$(echo "$LOADED_LINE" | cut -d' ' -f1)
+    [ -z "$PID" ] && { echo "no model loaded"; exit 0; }
+    grep -ah drm-resident-vram0 /proc/$PID/fdinfo/* 2>/dev/null | sort -u | head -1 \
+      | awk '{printf "%.1f GiB resident\n", $2/1048576}'
+    echo "$LOADED_LINE" | sed "s|.*-m $MODELS/\([^ ]*\).*|model: \1|"
+    ;;
+
+  gpu)    exec /usr/local/bin/gpu-stat "${2:-2}" ;;
+
+  plan)
+    [ -z "${2:-}" ] && { echo "usage: llm plan <file.gguf>"; exit 1; }
+    F=$(find_model "$2")
+    [ -n "$F" ] || { echo "not found: $2"; exit 1; }
+    # Pair it with a vision projector from the same directory if present.
+    MM=$(find "$(dirname "$F")" -name 'mmproj-*.gguf' 2>/dev/null | head -1)
+    if [ -n "$MM" ]; then
+      exec /usr/local/bin/llm-plan "$F" --mmproj "$MM"
+    else
+      exec /usr/local/bin/llm-plan "$F"
+    fi
+    ;;
+
+  bench)
+    M="${2:-muse-glimmer-30b-fast}"
+    N="${3:-200}"
+    P="${4:-4}"
+    case "$P" in ''|*[!0-9]*|0) echo "parallel count must be a positive integer, got: $P"; exit 1 ;; esac
+    PROMPT="Count from 1 upward, one number per line, until you are told to stop."
+
+    bench_one() {  # $1=output file
+      curl -s --max-time 900 $API/v1/chat/completions \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":$N,\"temperature\":0}" \
+        > "$1"
+    }
+
+    echo "benchmarking $M ($N tokens) ..."
+    echo
+    echo "--- sequential, 1 request ---"
+    OUT=$(mktemp)
+    bench_one "$OUT"
+    ERR=$(jq -r '.error.message // empty' "$OUT")
+    if [ -n "$ERR" ]; then echo "ERROR: $ERR"; rm -f "$OUT"; exit 1; fi
+    # Read raw and format in printf - jq's round/100 trick drops trailing
+    # zeros, so 26.0 would print as "26" while its neighbours show 2 decimals.
+    read -r PP PN GP GN GL < <(jq -r '.timings |
+      "\(.prompt_per_second // 0) \(.prompt_n // 0) \(.predicted_per_second // 0) \(.predicted_n // 0) \(.predicted_per_token_ms // 0)"' "$OUT")
+    printf "  prompt eval : %6.2f tok/s  (%s tokens)\n" "$PP" "$PN"
+    printf "  generation  : %6.2f tok/s  (%s tokens)\n" "$GP" "$GN"
+    printf "  gen latency : %6.2f ms/token\n" "$GL"
+    rm -f "$OUT"
+
+    echo
+    echo "--- parallel, $P concurrent requests ---"
+    # NOTE: this only controls how many requests are *sent*. The server's own
+    # slot count is --parallel N in the model's cmd: block in the llama-swap
+    # config; sending more than that just queues the excess upstream.
+    TMPDIR=$(mktemp -d)
+    T0=$(date +%s.%N)
+    for i in $(seq 1 "$P"); do
+      bench_one "$TMPDIR/$i.json" &
+    done
+    wait
+    T1=$(date +%s.%N)
+    WALL=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", b-a}')
+
+    TOTAL=0
+    for i in $(seq 1 "$P"); do
+      F="$TMPDIR/$i.json"
+      ERR=$(jq -r '.error.message // empty' "$F" 2>/dev/null)
+      if [ -n "$ERR" ]; then
+        echo "  request $i: ERROR: $ERR"
+        continue
+      fi
+      TPS=$(jq -r '.timings.predicted_per_second // 0' "$F")
+      NTOK=$(jq -r '.timings.predicted_n // 0' "$F")
+      printf "  request %2d: %6.2f tok/s  (%s tokens)\n" "$i" "$TPS" "$NTOK"
+      TOTAL=$((TOTAL + NTOK))
+    done
+    AGG=$(awk -v t="$TOTAL" -v w="$WALL" 'BEGIN{ if (w>0) printf "%.2f", t/w; else print "0" }')
+    echo "  ------------------------------------"
+    echo "  total: $TOTAL tokens in ${WALL}s wall = $AGG tok/s aggregate"
+    rm -rf "$TMPDIR"
+
+    echo
+    llm vram
+    ;;
+
+  ui)     shift; exec /usr/local/bin/llm-url "$@" ;;
+
+  gpu)    exec /usr/local/bin/gpu-stat "${2:-2}" ;;
+
+  plan)
+    [ -z "${2:-}" ] && { echo "usage: llm plan <file.gguf>"; exit 1; }
+    F=$(find_model "$2")
+    [ -n "$F" ] || { echo "not found: $2"; exit 1; }
+    # Pair it with a vision projector from the same directory if present.
+    MM=$(find "$(dirname "$F")" -name 'mmproj-*.gguf' 2>/dev/null | head -1)
+    if [ -n "$MM" ]; then
+      exec /usr/local/bin/llm-plan "$F" --mmproj "$MM"
+    else
+      exec /usr/local/bin/llm-plan "$F"
+    fi
+    ;;
+
+  *) usage ;;
+esac

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Point-in-time GPU utilisation for Intel Arc under the xe driver.
+# intel_gpu_top does not support xe, so this reads DRM fdinfo + sysfs directly.
+set -uo pipefail
+
+INTERVAL="${1:-2}"
+CARD=/sys/class/drm/card0/device
+
+read_energy() { cat $CARD/hwmon/hwmon*/energy1_input 2>/dev/null | head -1; }
+
+# Sum engine cycles across every client using the GPU.
+sample() {  # -> "ccs bcs rcs total"
+  local ccs=0 bcs=0 rcs=0 total=0 v
+  for fd in /proc/[0-9]*/fdinfo/*; do
+    [ -r "$fd" ] || continue
+    grep -qa '^drm-driver:.*xe' "$fd" 2>/dev/null || continue
+    v=$(grep -a '^drm-cycles-ccs:' "$fd" 2>/dev/null | awk '{print $2}'); ccs=$((ccs + ${v:-0}))
+    v=$(grep -a '^drm-cycles-bcs:' "$fd" 2>/dev/null | awk '{print $2}'); bcs=$((bcs + ${v:-0}))
+    v=$(grep -a '^drm-cycles-rcs:' "$fd" 2>/dev/null | awk '{print $2}'); rcs=$((rcs + ${v:-0}))
+    v=$(grep -a '^drm-total-cycles-ccs:' "$fd" 2>/dev/null | awk '{print $2}')
+    [ "${v:-0}" -gt "$total" ] 2>/dev/null && total=${v:-0}
+  done
+  echo "$ccs $bcs $rcs $total"
+}
+
+E1=$(read_energy); read C1 B1 R1 T1 <<< "$(sample)"
+sleep "$INTERVAL"
+E2=$(read_energy); read C2 B2 R2 T2 <<< "$(sample)"
+
+DT=$((T2 - T1))
+pct() { [ "$DT" -gt 0 ] && awk -v a="$1" -v d="$DT" 'BEGIN{printf "%.1f", (a/d)*100}' || echo "n/a"; }
+
+echo "=== Intel Arc B-series (xe) ==="
+printf '  compute (ccs) : %s %%\n' "$(pct $((C2 - C1)))"
+printf '  copy    (bcs) : %s %%\n' "$(pct $((B2 - B1)))"
+printf '  render  (rcs) : %s %%\n' "$(pct $((R2 - R1)))"
+
+if [ -n "${E1:-}" ] && [ -n "${E2:-}" ]; then
+  # energy1_input is microjoules; delta / interval = watts
+  awk -v e1="$E1" -v e2="$E2" -v t="$INTERVAL" \
+    'BEGIN{printf "  power         : %.1f W\n", (e2-e1)/1000000/t}'
+fi
+
+for gt in 0 1; do
+  f=$CARD/tile0/gt$gt/freq0/cur_freq
+  [ -r "$f" ] && printf '  gt%s freq      : %s MHz (max %s)\n' "$gt" "$(cat $f)" \
+    "$(cat $CARD/tile0/gt$gt/freq0/max_freq 2>/dev/null)"
+done
+
+TOTVRAM=$(awk '/VISIBLE VRAM|physical size/ {print}' /dev/null 2>/dev/null)
+USED=$(for fd in /proc/[0-9]*/fdinfo/*; do
+         grep -qa '^drm-driver:.*xe' "$fd" 2>/dev/null || continue
+         grep -a '^drm-resident-vram0:' "$fd" 2>/dev/null | awk '{print $2}'
+       done | sort -rn | head -1)
+[ -n "${USED:-}" ] && awk -v u="$USED" 'BEGIN{printf "  vram resident : %.1f GiB / 31.9 GiB\n", u/1048576}'
+
+echo "  clients       :"
+for p in $(pgrep -f 'llama-server' 2>/dev/null); do
+  n=$(ps -o comm= -p "$p" 2>/dev/null)
+  m=$(ps -o cmd= -p "$p" 2>/dev/null | sed 's|.*-m /opt/models/gguf/\([^ ]*\).*|\1|')
+  printf '    pid %-7s %s  %s\n' "$p" "$n" "$m"
+done
