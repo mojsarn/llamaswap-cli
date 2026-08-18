@@ -332,12 +332,29 @@ PY
     N="${3:-200}"
     P="${4:-4}"
     case "$P" in ''|*[!0-9]*|0) echo "parallel count must be a positive integer, got: $P"; exit 1 ;; esac
-    PROMPT="Count from 1 upward, one number per line, until you are told to stop."
 
-    bench_one() {  # $1=output file
+    # Varied prompts, deliberately NOT a repetitive task. A prompt like
+    # "count upward" makes the model emit near-identical tokens, which on a
+    # disk-paged MoE routes to a narrow set of experts and keeps them all in
+    # page cache - that inflated DeepSeek results ~4x before this was fixed.
+    # Parallel requests each get a DIFFERENT prompt for the same reason:
+    # identical prompts share expert routing and understate the real cost.
+    PROMPTS=(
+      "Explain how a bicycle stays upright while moving."
+      "Describe the main differences between TCP and UDP."
+      "Summarise how the water cycle works."
+      "Explain what causes the seasons on Earth."
+      "Describe how a lithium-ion battery stores energy."
+      "Explain the difference between compiled and interpreted languages."
+      "Summarise the invention and impact of the printing press."
+      "Explain how noise-cancelling headphones work."
+    )
+
+    bench_one() {  # $1=output file  $2=prompt index
+      local q="${PROMPTS[$(( ${2:-0} % ${#PROMPTS[@]} ))]}"
       curl -s --max-time 900 $API/v1/chat/completions \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":$N,\"temperature\":0}" \
+        -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"$q\"}],\"max_tokens\":$N,\"temperature\":0}" \
         > "$1"
     }
 
@@ -345,7 +362,7 @@ PY
     echo
     echo "--- sequential, 1 request ---"
     OUT=$(mktemp)
-    bench_one "$OUT"
+    bench_one "$OUT" 0
     ERR=$(jq -r '.error.message // empty' "$OUT")
     if [ -n "$ERR" ]; then echo "ERROR: $ERR"; rm -f "$OUT"; exit 1; fi
     # Read raw and format in printf - jq's round/100 trick drops trailing
@@ -365,7 +382,7 @@ PY
     TMPDIR=$(mktemp -d)
     T0=$(date +%s.%N)
     for i in $(seq 1 "$P"); do
-      bench_one "$TMPDIR/$i.json" &
+      bench_one "$TMPDIR/$i.json" "$i" &
     done
     wait
     T1=$(date +%s.%N)
