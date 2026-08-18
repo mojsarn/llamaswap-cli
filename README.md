@@ -1,4 +1,4 @@
-# llm-tools
+# llamaswap-cli
 
 The custom command suite for the mojs-AI inference server. None of this is
 upstream software — it is plain bash and python written for this one machine,
