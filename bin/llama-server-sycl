@@ -5,4 +5,8 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:0}"
+# Default CPU thread count. llama.cpp's own default (-1) resolves to 8 here,
+# the physical core count; 12 is a deliberate override. An explicit
+# -t/--threads in a model's cmd: block still takes precedence over this.
+export LLAMA_ARG_THREADS="${LLAMA_ARG_THREADS:-12}"
 exec /home/mojs/llama.cpp/build-sycl/bin/llama-server "$@"

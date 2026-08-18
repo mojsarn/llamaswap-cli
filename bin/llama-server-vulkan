@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
 # llama-server on the Vulkan backend. Fallback for architectures SYCL mishandles.
+# Default CPU thread count. llama.cpp's own default (-1) resolves to 8 here,
+# the physical core count; 12 is a deliberate override. An explicit
+# -t/--threads in a model's cmd: block still takes precedence over this.
+export LLAMA_ARG_THREADS="${LLAMA_ARG_THREADS:-12}"
 exec /home/mojs/llama.cpp/build-vulkan/bin/llama-server "$@"

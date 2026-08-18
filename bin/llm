@@ -291,7 +291,7 @@ PY
     rmdir -p --ignore-fail-on-non-empty "$(dirname "$F")" 2>/dev/null
     ;;
 
-  edit)   sudo "${EDITOR:-nano}" "$CONFIG" ;;
+  edit)   sudo "${EDITOR:-mcedit}" "$CONFIG" ;;
 
   reload)
     sudo systemctl restart llama-swap; sleep 3
