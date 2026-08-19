@@ -294,7 +294,25 @@ PY
   edit)   sudo "${EDITOR:-mcedit}" "$CONFIG" ;;
 
   reload)
-    sudo systemctl restart llama-swap; sleep 3
+    # llama-swap runs with -watch-config, so it re-reads the config itself and
+    # KEEPS RUNNING MODELS LOADED. A systemctl restart would bounce the service
+    # and unload whatever is resident - minutes of reload for the big models.
+    # Fall back to a restart if the flag is not set on the unit.
+    if grep -qs -- '-watch-config' /etc/systemd/system/llama-swap.service; then
+      sudo touch "$CONFIG"
+      for _ in $(seq 1 40); do
+        journalctl -u llama-swap --since '15 seconds ago' --no-pager 2>/dev/null \
+          | grep -qa 'configuration reloaded' && break
+        sleep 0.25
+      done
+    else
+      echo "(-watch-config not set on the unit; falling back to a full restart)"
+      sudo systemctl restart llama-swap
+      for _ in $(seq 1 30); do
+        curl -s --max-time 2 $API/v1/models >/dev/null 2>&1 && break
+        sleep 1
+      done
+    fi
     systemctl is-active llama-swap
     curl -s --max-time 10 $API/v1/models | jq -r '.data[].id'
     ;;
